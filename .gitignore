@@ -1,0 +1,23 @@
+# Caché de texto de PDFs descargados (13+ MB, se regenera al scrapear)
+cache_pdfs.json
+
+# Logs de corridas de scraping
+scrape_log*.txt
+scrape_err*.txt
+
+# Backups y volcados intermedios de corridas previas
+proyectos.anterior.json
+proyectos.antes-ursae.json
+proyectos.nuevo.json
+proyectos.pre-ursae-merge.json
+nuevos_detalle.json
+nuevos_parque_solar.json
+diff_proyectos.txt
+top_nuevos.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# Material de marca (binario grande, no es parte del código)
+*.pdf
