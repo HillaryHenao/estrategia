@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from collections import Counter, defaultdict
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -33,9 +34,15 @@ def normalizar_nit(nit):
     return n or None
 
 
+def _quitar_tildes(texto):
+    """'ENERGÍA' -> 'ENERGIA', para que la agrupación no dependa de si el PDF trae tildes."""
+    return "".join(c for c in unicodedata.normalize("NFKD", texto) if not unicodedata.combining(c))
+
+
 def normalizar_para_agrupar(nombre_limpio):
-    """Uppercase sin puntos ni espacios repetidos, para comparar 'SUNTACC SAS' == 'SUNTACC S.A.S.'"""
-    n = nombre_limpio.upper().replace(".", "")
+    """Uppercase sin tildes ni puntos ni espacios repetidos, para comparar 'SUNTACC SAS' ==
+    'SUNTACC S.A.S.' == 'SUNTACC ENERGÍA SAS' con 'SUNTACC ENERGIA SAS'."""
+    n = _quitar_tildes(nombre_limpio.upper()).replace(".", "")
     return re.sub(r"\s+", " ", n).strip()
 
 
@@ -54,7 +61,7 @@ PALABRAS_GENERICAS = {
 
 
 def _palabra_normalizada(palabra):
-    return re.sub(r"[^0-9A-ZÁÉÍÓÚÑ]", "", palabra.upper())
+    return re.sub(r"[^0-9A-Z]", "", _quitar_tildes(palabra.upper()))
 
 
 def _prefijo_compartido(nombre_a, nombre_b):
@@ -405,7 +412,8 @@ def main():
     border: 1px solid #cbd5e1;
     border-radius: 8px;
     box-shadow: 0 8px 24px rgba(0,0,0,0.18);
-    width: 320px;
+    width: 380px;
+    max-width: min(380px, calc(100vw - 48px));
     padding: 10px;
   }}
   .multiselect-panel.abierto {{ display: block; }}
@@ -430,20 +438,33 @@ def main():
     color: #1a1a2e;
   }}
   .multiselect-acciones button:hover {{ background: #eef2f7; }}
-  .multiselect-lista {{ max-height: 260px; overflow-y: auto; }}
+  .multiselect-lista {{ max-height: 260px; overflow-y: auto; overflow-x: hidden; }}
   .multiselect-lista label {{
     display: flex;
-    align-items: center;
-    gap: 7px;
+    align-items: flex-start;
+    gap: 8px;
     font-weight: 400;
     font-size: 0.8rem;
-    padding: 4px 3px;
+    line-height: 1.35;
+    padding: 5px 4px;
     cursor: pointer;
     color: #1a1a2e;
     border-radius: 4px;
   }}
   .multiselect-lista label:hover {{ background: #f0f7ff; }}
-  .multiselect-lista input[type="checkbox"] {{ cursor: pointer; flex: none; }}
+  .multiselect-lista input[type="checkbox"] {{
+    cursor: pointer;
+    flex: none;
+    width: 14px;
+    height: 14px;
+    margin: 2px 0 0;
+    accent-color: #0f3460;
+  }}
+  .multiselect-lista label span {{
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }}
   .multiselect-vacio {{ font-size: 0.8rem; color: #999; padding: 6px 2px; font-style: italic; }}
 
   .tabla-wrapper {{
@@ -785,7 +806,7 @@ document.getElementById("filtro-anio").addEventListener("change", aplicarFiltros
 // ── Multiselect de empresas ─────────────────────────────────────────────────
 function nombreEmpresa(e) {{
   if (e === SIN_EMPRESA) return "(Sin empresa)";
-  return e.length > 55 ? e.slice(0, 55) + "…" : e;
+  return e;
 }}
 
 function renderListaEmpresas(filtro = "") {{
