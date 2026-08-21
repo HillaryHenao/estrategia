@@ -46,6 +46,20 @@ def normalizar_para_agrupar(nombre_limpio):
     return re.sub(r"\s+", " ", n).strip()
 
 
+# Erratas puntuales confirmadas en el texto de alguna resolución (no una regla
+# general de fuzzy-matching, que arriesgaría fusionar empresas distintas por
+# error): se corrigen palabra por palabra antes de agrupar.
+_ERRATAS_CONOCIDAS = {
+    "ENERIGIA": "ENERGIA",  # "ERCO ENERIGIA S.A.S" -> "ERCO ENERGIA S.A.S"
+}
+
+
+def corregir_erratas_conocidas(nombre):
+    palabras = nombre.split(" ")
+    corregidas = [_ERRATAS_CONOCIDAS.get(p.upper(), p) for p in palabras]
+    return " ".join(corregidas)
+
+
 # Términos genéricos del sector / relleno de nombres societarios en español.
 # No cuentan como palabra "de marca" al decidir si dos nombres son la misma
 # familia empresarial (ver _es_marca_compartida): comparten estas palabras
@@ -167,7 +181,7 @@ def agrupar_empresas(proyectos):
             continue
         frecuencia[sol] += 1
         if sol not in info:
-            nombre_limpio = limpiar_nombre_empresa(sol)
+            nombre_limpio = corregir_erratas_conocidas(limpiar_nombre_empresa(sol))
             info[sol] = {
                 "nombre_limpio": nombre_limpio,
                 "nit_norm": normalizar_nit(p.get("nit")),
@@ -809,11 +823,15 @@ function nombreEmpresa(e) {{
   return e;
 }}
 
+function empresasVisibles(filtro = "") {{
+  const q = filtro.toLowerCase();
+  return EMPRESAS.filter(e => nombreEmpresa(e).toLowerCase().includes(q));
+}}
+
 function renderListaEmpresas(filtro = "") {{
   const cont = document.getElementById("lista-emp");
-  const q = filtro.toLowerCase();
   cont.innerHTML = "";
-  const visibles = EMPRESAS.filter(e => nombreEmpresa(e).toLowerCase().includes(q));
+  const visibles = empresasVisibles(filtro);
   if (visibles.length === 0) {{
     cont.innerHTML = '<div class="multiselect-vacio">Sin resultados</div>';
     return;
@@ -854,14 +872,16 @@ document.getElementById("btn-emp").addEventListener("click", (e) => {{
 }});
 document.getElementById("buscar-emp").addEventListener("input", (e) => renderListaEmpresas(e.target.value));
 document.getElementById("emp-todas").addEventListener("click", () => {{
-  empresasSeleccionadas = new Set(EMPRESAS);
-  renderListaEmpresas(document.getElementById("buscar-emp").value);
+  const filtro = document.getElementById("buscar-emp").value;
+  empresasVisibles(filtro).forEach(e => empresasSeleccionadas.add(e));
+  renderListaEmpresas(filtro);
   actualizarBotonEmp();
   aplicarFiltros();
 }});
 document.getElementById("emp-ninguna").addEventListener("click", () => {{
-  empresasSeleccionadas = new Set();
-  renderListaEmpresas(document.getElementById("buscar-emp").value);
+  const filtro = document.getElementById("buscar-emp").value;
+  empresasVisibles(filtro).forEach(e => empresasSeleccionadas.delete(e));
+  renderListaEmpresas(filtro);
   actualizarBotonEmp();
   aplicarFiltros();
 }});
