@@ -60,6 +60,76 @@ def corregir_erratas_conocidas(nombre):
     return " ".join(corregidas)
 
 
+# Los 33 departamentos oficiales de Colombia (32 + Bogotá D.C.), en la
+# ortografía que se muestra en el filtro y en la tabla.
+DEPARTAMENTOS_OFICIALES = [
+    "Amazonas", "Antioquia", "Arauca", "Atlántico", "Bogotá D.C.", "Bolívar",
+    "Boyacá", "Caldas", "Caquetá", "Casanare", "Cauca", "Cesar", "Chocó",
+    "Córdoba", "Cundinamarca", "Guainía", "Guaviare", "Huila", "La Guajira",
+    "Magdalena", "Meta", "Nariño", "Norte de Santander", "Putumayo",
+    "Quindío", "Risaralda", "San Andrés y Providencia", "Santander", "Sucre",
+    "Tolima", "Valle del Cauca", "Vaupés", "Vichada",
+]
+
+# Ruido de extracción de PDF que a veces queda pegado al final del nombre del
+# departamento (colillas de otra frase, acotaciones entre paréntesis, etc.).
+_RUIDO_DEPTO_RE = re.compile(
+    r"\s*(identificad[oa].*|\(.*\)|:.*)$",
+    re.IGNORECASE,
+)
+
+# Variantes que no se pueden resolver por normalización de tildes/puntuación
+# (typos u otro texto pegado por error) -> forma normalizada del departamento
+# oficial al que corresponden. Confirmado contra la fuente_url de cada caso.
+_DEPTO_ERRATAS_CONOCIDAS = {
+    "LA BOLIVAR": "BOLIVAR",  # fuente_url: "...departamento-bolivar-municipios-san-estanislao"
+    "GUAJIRA": "LA GUAJIRA",  # forma corta usual de "La Guajira"
+    "VALLE": "VALLE DEL CAUCA",  # forma corta usual de "Valle del Cauca"
+}
+
+_DEPTOS_NORM_A_OFICIAL = {
+    _quitar_tildes(d.upper()).replace(".", "").strip(): d for d in DEPARTAMENTOS_OFICIALES
+}
+
+
+# Casos donde la extracción del PDF capturó un fragmento de oración en vez del
+# nombre de la empresa solicitante. Se corrigen al nombre real cuando es
+# identificable, o se tratan como "sin empresa" (None) cuando no lo es, para
+# no ensuciar el filtro ni la tabla con basura. Claves normalizadas (sin
+# tildes/puntuación) para no depender de cómo vino cada PDF.
+_SOLICITANTE_FRAGMENTOS_CONOCIDOS = {
+    "PROMOTORA DEL PROYECTO ES LA SOCIEDAD COMERCIAL ABO WIND RENOVABLES PROYECTO TRES SAS ESP":
+        "ABO WIND RENOVABLES PROYECTO TRES S.A.S. E.S.P",
+    "CUANDO SE ESTABLECIO EN LA REGION TENIENDO EN CUENTA LA CONDICION DE LUGAR ESPECIAL DE ALOJAMIENTO (LEA) QUE": None,
+    "EN UN ESPACIO Y": None,
+    "EN UN ESPACIO Y TIEMPO": None,
+    "TIENE BAJO OPERACION 109 MW EN PLANTAS SOLARES FOTOVOLTAICAS": None,
+}
+
+
+def corregir_solicitante(sol):
+    """Corrige o descarta fragmentos de oración mal capturados como si fueran
+    el nombre de la empresa (ver _SOLICITANTE_FRAGMENTOS_CONOCIDOS)."""
+    if not sol:
+        return sol
+    clave = normalizar_para_agrupar(limpiar_nombre_empresa(sol))
+    if clave in _SOLICITANTE_FRAGMENTOS_CONOCIDOS:
+        return _SOLICITANTE_FRAGMENTOS_CONOCIDOS[clave]
+    return sol
+
+
+def canonicalizar_departamento(nombre):
+    """Corrige tildes, puntuación de sobra y ruido de extracción para que
+    'Atlantico' / 'Atlántico' / 'Atlántico:' caigan en un solo 'Atlántico',
+    igual que ocurría con los nombres de empresa."""
+    if not nombre:
+        return nombre
+    limpio = _RUIDO_DEPTO_RE.sub("", nombre.strip()).strip(" .\"'“”")
+    norm = _quitar_tildes(limpio.upper()).replace(".", "").strip()
+    norm = _DEPTO_ERRATAS_CONOCIDAS.get(norm, norm)
+    return _DEPTOS_NORM_A_OFICIAL.get(norm, limpio)
+
+
 # Términos genéricos del sector / relleno de nombres societarios en español.
 # No cuentan como palabra "de marca" al decidir si dos nombres son la misma
 # familia empresarial (ver _es_marca_compartida): comparten estas palabras
@@ -238,6 +308,38 @@ def agrupar_empresas(proyectos):
     return empresa_canonica_final, empresas_ordenadas
 
 
+_RUIDO_SLUG_RE = re.compile(r"-ubicad[oa]-en-el-municipio-de-.*$", re.IGNORECASE)
+_CONECTORES_TITULO = {"de", "del", "la", "las", "el", "los", "en", "y", "a"}
+
+
+def nombre_desde_url(fuente_url):
+    """Deriva un título legible del slug de la URL cuando el PDF no traía uno,
+    ej. '.../fotovoltaico-solar-melgar-9-9-mw-ubicado-en-el-municipio-de-melgar-
+    departamento-del-tolima/' -> 'Fotovoltaico Solar Melgar 9.9 MW' (se recorta
+    la cola de municipio/departamento porque ya se muestra en su propia columna)."""
+    if not fuente_url:
+        return None
+    slug = fuente_url.rstrip("/").rsplit("/", 1)[-1]
+    slug = _RUIDO_SLUG_RE.sub("", slug)
+    slug = re.sub(r"(\d+)-(\d+)-mw\b", r"\1.\2 mw", slug)
+    slug = re.sub(r"(\d+)-(\d+)-kw\b", r"\1.\2 kw", slug)
+    slug = re.sub(r"(?<=\d)-mw\b", " mw", slug)
+    slug = re.sub(r"(?<=\d)-kw\b", " kw", slug)
+    palabras = [w for w in re.split(r"[-\s]+", slug) if w]
+    if not palabras:
+        return None
+    resultado = []
+    for w in palabras:
+        wl = w.lower()
+        if wl in ("mw", "kw"):
+            resultado.append(w.upper())
+        elif wl in _CONECTORES_TITULO and resultado:
+            resultado.append(wl)
+        else:
+            resultado.append(w.capitalize())
+    return " ".join(resultado)
+
+
 def anio_resolucion(fecha):
     if not fecha:
         return None
@@ -270,6 +372,14 @@ def main():
 
     with open(ENTRADA, encoding="utf-8") as f:
         proyectos = json.load(f)
+
+    for p in proyectos:
+        if p.get("departamento"):
+            p["departamento"] = canonicalizar_departamento(p["departamento"])
+        if p.get("solicitante"):
+            p["solicitante"] = corregir_solicitante(p["solicitante"])
+        if not p.get("nombre"):
+            p["nombre_inferido"] = nombre_desde_url(p.get("fuente_url"))
 
     con_mapa = [p for p in proyectos if p.get("lat") and p.get("lon")]
     sin_mapa = [p for p in proyectos if not (p.get("lat") and p.get("lon"))]
@@ -526,6 +636,7 @@ def main():
   .badge.sin-mapa {{ background: #fef3c7; color: #92400e; }}
 
   .nombre-proyecto {{ font-weight: 600; max-width: 260px; line-height: 1.3; }}
+  .nombre-inferido-marca {{ color: #b45309; font-weight: 400; cursor: help; }}
   .link-pdf {{
     color: #0f3460;
     text-decoration: none;
@@ -666,6 +777,14 @@ function capLabel(kw) {{
   return kw.toFixed(0) + " kW";
 }}
 function val(v) {{ return v || '<span class="sin-datos">—</span>'; }}
+function nombreTexto(p) {{ return p.nombre || p.nombre_inferido || null; }}
+function nombreProyectoHtml(p) {{
+  if (p.nombre) return p.nombre;
+  if (p.nombre_inferido) {{
+    return `${{p.nombre_inferido}} <span class="nombre-inferido-marca" title="El PDF no traía un título: este nombre se infirió de la URL de la resolución">✳</span>`;
+  }}
+  return '<span class="sin-datos">Sin nombre</span>';
+}}
 function anioResolucion(fecha) {{
   if (!fecha) return null;
   const m = fecha.match(/\\d{{4}}/);
@@ -718,14 +837,14 @@ DATOS.forEach((p, i) => {{
   }}[clase];
 
   m.bindPopup(`
-    <div class="popup-nombre">${{p.nombre || "Sin nombre"}}</div>
+    <div class="popup-nombre">${{nombreProyectoHtml(p)}}</div>
     <span class="popup-badge" style="${{badgeColor}}">${{capLabel(p.capacidad_kw)}}</span>
     <br><br>
     <div class="popup-fila"><b>Municipio:</b> ${{p.municipio || "—"}}, ${{p.departamento || "—"}}</div>
     <div class="popup-fila"><b>Empresa:</b> ${{p.solicitante || "—"}}</div>
     <div class="popup-fila"><b>Resolución:</b> ${{p.fecha_resolucion || "—"}}</div>
     <div class="popup-fila"><b>Resolución:</b> ${{p.resolucion || "—"}} · ${{p.fecha_resolucion || "—"}}</div>
-    ${{p.pdf_url ? `<a class="popup-link" href="${{p.pdf_url}}" target="_blank">📄 Ver resolución PDF</a>` : ""}}
+    ${{p.pdf_url ? `<a class="popup-link" href="${{p.pdf_url}}" target="_blank" rel="noopener">📄 Ver resolución PDF</a>` : ""}}
   `, {{ maxWidth: 320 }});
 
   m.addTo(map);
@@ -745,7 +864,7 @@ function renderTabla(datos) {{
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>
-        <div class="nombre-proyecto">${{p.nombre || '<span class="sin-datos">Sin nombre</span>'}}</div>
+        <div class="nombre-proyecto">${{nombreProyectoHtml(p)}}</div>
       </td>
       <td><span class="badge ${{clase}}">${{capLabel(p.capacidad_kw)}}</span></td>
       <td>${{val(p.municipio)}}</td>
@@ -760,7 +879,7 @@ function renderTabla(datos) {{
       </td>
       <td style="text-align:center">
         ${{p.pdf_url
-          ? `<a href="${{p.pdf_url}}" target="_blank" title="Ver resolución PDF"
+          ? `<a href="${{p.pdf_url}}" target="_blank" rel="noopener" title="Ver resolución PDF"
                style="display:inline-block;padding:4px 8px;background:#0f3460;color:#fff;border-radius:5px;font-size:0.75rem;text-decoration:none;white-space:nowrap">
                📄 PDF</a>`
           : '<span class="sin-datos">—</span>'}}
@@ -799,7 +918,7 @@ function aplicarFiltros() {{
   const anio = document.getElementById("filtro-anio").value;
 
   let resultado = DATOS.filter(p => {{
-    const texto = [p.nombre, p.municipio, p.departamento, p.solicitante, p.resolucion]
+    const texto = [nombreTexto(p), p.municipio, p.departamento, p.solicitante, p.resolucion]
       .filter(Boolean).join(" ").toLowerCase();
     const okQ = !q || texto.includes(q);
     const okD = !dept || p.departamento === dept;
@@ -814,6 +933,9 @@ function aplicarFiltros() {{
       if (colOrden === "en_mapa") {{
         va = (a.lat && a.lon) ? 1 : 0;
         vb = (b.lat && b.lon) ? 1 : 0;
+      }} else if (colOrden === "nombre") {{
+        va = nombreTexto(a) ?? "";
+        vb = nombreTexto(b) ?? "";
       }} else {{
         va = a[colOrden] ?? "";
         vb = b[colOrden] ?? "";
