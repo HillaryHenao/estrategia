@@ -38,7 +38,7 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 TERMINOS = ["minigranja", "generacion+distribuida", "parque+solar"]
-EMPRESAS_EXCLUIDAS = ["UNERGY"]
+EMPRESAS_EXCLUIDAS = []
 CACHE_FILE = "cache_pdfs.json"
 TIMEOUT = 60
 REINTENTOS = 3
@@ -264,6 +264,105 @@ def extraer_resolucion_fecha(texto):
     return resolucion, f"{int(dia)} de {mes} de {anio}"
 
 
+_PATRON_MW_KW = r'(\d+(?:[.,]\d+)?)\s*(MW[pPnN]?|KW[pPnN]?)'
+
+# Frases de umbral regulatorio (FNCER / generación distribuida) que preceden a
+# una cifra de MW/KW sin que esa cifra sea la capacidad real del proyecto, ej.
+# "...proyectos con potencia superior a los 10 MW..." o "...planta con
+# capacidad menor a 1MW...". Se usan para descartar esos números del escaneo
+# genérico de último recurso (ver extraer_capacidad).
+_CONTEXTO_UMBRAL_RE = re.compile(
+    r'(?:menor|inferior|superior|mayor)(?:\s+o\s+igual)?\s+a\s+(?:los\s+|las\s+)?$',
+    re.IGNORECASE,
+)
+
+
+def extraer_capacidad(nombre, texto):
+    """
+    Busca la capacidad del proyecto en orden de confiabilidad:
+      1. En el nombre del proyecto (ej. "...9.9 MW..."), si lo trae.
+      2. La frase explícita "capacidad (instalada) de X kW/MW" en el cuerpo del
+         PDF (sección de descripción del proyecto), ej. "Capacidad de 990 kW".
+      3. Como último recurso, la primera mención de "número + MW/KW" en el
+         texto completo que NO esté precedida por una frase de umbral
+         regulatorio (ver _CONTEXTO_UMBRAL_RE) — evita enganchar boilerplate
+         legal como "potencia superior a los 10 MW" en vez de la capacidad
+         real del proyecto.
+    """
+    I = re.IGNORECASE
+    if nombre:
+        m = re.search(_PATRON_MW_KW, nombre, I)
+        if m:
+            return m
+
+    m = re.search(r'capacidad\s+(?:instalada\s+)?de\s+' + _PATRON_MW_KW, texto, I)
+    if m:
+        return re.search(_PATRON_MW_KW, m.group(0), I)
+
+    for m in re.finditer(_PATRON_MW_KW, texto, I):
+        contexto_previo = texto[max(0, m.start() - 45):m.start()]
+        if _CONTEXTO_UMBRAL_RE.search(contexto_previo):
+            continue
+        return m
+
+    return None
+
+
+def limpio(s):
+    return re.sub(r'\s+', ' ', s or '').strip()
+
+
+# Conectores que a veces quedan pegados al final del municipio capturado
+# porque el corte antes de "departamento" (ver extraer_ubicacion) no exige
+# coma previa, ej. "Guamo en el" (de "...municipio de Guamo en el
+# departamento de Tolima") o "El Copey jurisdicción del" (de "...jurisdicción
+# del Departamento del Cesar").
+_RUIDO_MUNICIPIO_RE = re.compile(
+    r'\s+(?:en\s+el|en\s+la|jurisdicci[oó]n\s+del?|y\s+al\s+interior\s+del?)\s*$',
+    re.IGNORECASE,
+)
+
+
+def extraer_ubicacion(texto):
+    """
+    Estructura típica: "municipio de X[, vereda/correg Y,] [en el] departamento
+    de Z". Se busca municipio y luego departamento dentro de un rango cercano.
+    Admite tanto "de" como "del" (departamentos masculinos: Cesar, Meta,
+    Tolima... vs. de Bolívar, de La Guajira...).
+    """
+    # Nota: se excluyen , ; . del texto capturado pero NO el salto de línea,
+    # porque el PDF a veces parte el nombre justo ahí (ej. "La\nGuajira",
+    # "departamento del\nCesar"); limpio() colapsa esos saltos a un espacio.
+    # La captura del municipio corta además apenas aparece la palabra
+    # "departamento" (sin exigir coma antes), porque muchos PDFs escriben
+    # "municipio de X en el departamento de Y" o "...X jurisdicción del
+    # Departamento de Y" sin coma de separación, y sin este corte el grupo se
+    # comía también el departamento, dejándolo vacío.
+    # El "de"/"del" es opcional: algunos PDFs escriben "municipio Aguachica,"
+    # directo, sin preposición.
+    I = re.IGNORECASE
+    m_mun = re.search(
+        r'municipios?\s+(?:del?\s+)?(.{3,45}?)(?=\s*[,;.]|\bdepartamento\b|$)',
+        texto, I | re.DOTALL,
+    )
+    if not m_mun:
+        return None, None
+    crudo = limpio(m_mun.group(1))
+    crudo = _RUIDO_MUNICIPIO_RE.sub('', crudo).strip()
+    municipio = crudo.title()
+    fragmento = texto[m_mun.end(): m_mun.end() + 220]
+    # Corta antes de conectores/puntuación que suelen seguir al departamento
+    # en la misma oración ("...del Tolima, localizado en...", "...del Cesar y
+    # en el municipio de...", comillas de cierre, paréntesis, dos puntos).
+    m_dep = re.search(
+        r'departamento\s+del?\s+(.{3,40}?)'
+        r'(?=\s*[,;.:)”“"\']|\s+(?:y\s+en|que\s+se|localiza\w*|ubicad[oa]|identificad[oa])\b|$)',
+        fragmento, I | re.DOTALL,
+    )
+    departamento = limpio(m_dep.group(1)).title() if m_dep else None
+    return municipio, departamento
+
+
 def parsear_proyecto(texto, url_fuente, pdf_url):
     """Extrae los campos del proyecto desde el texto del PDF."""
     I = re.IGNORECASE
@@ -289,9 +388,6 @@ def parsear_proyecto(texto, url_fuente, pdf_url):
         "lat": None,
         "lon": None,
     }
-
-    def limpio(s):
-        return re.sub(r'\s+', ' ', s or '').strip()
 
     # ── Resolución y fecha ──
     proyecto["resolucion"], proyecto["fecha_resolucion"] = extraer_resolucion_fecha(texto)
@@ -325,8 +421,7 @@ def parsear_proyecto(texto, url_fuente, pdf_url):
         proyecto["tipo"] = "Energía Renovable"
 
     # ── Capacidad ──
-    fuente_cap = proyecto["nombre"] or texto
-    m = re.search(r'(\d+(?:[.,]\d+)?)\s*(MW[pPnN]?|KW[pPnN]?)', fuente_cap, I)
+    m = extraer_capacidad(proyecto["nombre"], texto)
     if m:
         proyecto["capacidad_texto"] = limpio(m.group(0))
         val = float(m.group(1).replace(',', '.'))
@@ -334,16 +429,7 @@ def parsear_proyecto(texto, url_fuente, pdf_url):
         proyecto["capacidad_kw"] = round(val * 1000 if 'MW' in unidad else val, 2)
 
     # ── Municipio y departamento ──
-    # Estructura: "municipio de X[, vereda/correg Y,] [en el] departamento de Z"
-    # Se busca municipio y luego departamento por separado dentro de un rango cercano
-    m_mun = re.search(r'municipio\s+de\s+([^,;.\n]{3,45})', texto, I)
-    if m_mun:
-        proyecto["municipio"] = limpio(m_mun.group(1)).title()
-        # Buscar departamento en los siguientes 200 caracteres
-        fragmento = texto[m_mun.end(): m_mun.end() + 220]
-        m_dep = re.search(r'departamento\s+de\s+([^,;.\n]{3,40})', fragmento, I)
-        if m_dep:
-            proyecto["departamento"] = limpio(m_dep.group(1)).title()
+    proyecto["municipio"], proyecto["departamento"] = extraer_ubicacion(texto)
 
     # ── Vereda / corregimiento ──
     m = re.search(r'(?:vereda|corregimiento|inspecci[oó]n)\s+(?:de\s+)?([^,;.\n]{3,40}?)(?:[,;.\n])', texto, I)

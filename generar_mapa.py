@@ -74,7 +74,7 @@ DEPARTAMENTOS_OFICIALES = [
 # Ruido de extracción de PDF que a veces queda pegado al final del nombre del
 # departamento (colillas de otra frase, acotaciones entre paréntesis, etc.).
 _RUIDO_DEPTO_RE = re.compile(
-    r"\s*(identificad[oa].*|\(.*\)|:.*)$",
+    r"\s*(identificad[oa].*|localizad[oa].*|ubicad[oa].*|\(.*\)|:.*)$",
     re.IGNORECASE,
 )
 
@@ -365,6 +365,162 @@ def capacidad_label(kw):
     return f"{kw:.0f} kW"
 
 
+def escapar(s):
+    """Escape HTML mínimo para texto libre (nombres de empresa/departamento)."""
+    if s is None:
+        return ""
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def contar_por_empresa(proyectos, empresa_canonica):
+    """Nº de solicitudes por empresa (nombre canónico) dentro de una lista de proyectos."""
+    c = Counter()
+    for p in proyectos:
+        sol = p.get("solicitante")
+        nombre = empresa_canonica.get(sol) if sol else None
+        c[nombre or "(Sin empresa)"] += 1
+    return c.most_common()
+
+
+def render_ranking(pares, max_n=15, color="#0f3460"):
+    """Lista de barras horizontales 'nombre — cantidad', escalada al máximo del propio ranking."""
+    top = pares[:max_n]
+    if not top:
+        return '<div class="analisis-vacio">Sin datos</div>'
+    maximo = max(c for _, c in top)
+    filas = []
+    for nombre, cnt in top:
+        pct = round(cnt / maximo * 100, 1) if maximo else 0
+        filas.append(f'''
+          <div class="barra-fila">
+            <div class="barra-label" title="{escapar(nombre)}">{escapar(nombre)}</div>
+            <div class="barra-track"><div class="barra-fill" style="width:{pct}%;background:{color}"></div></div>
+            <div class="barra-valor">{cnt}</div>
+          </div>''')
+    return "\n".join(filas)
+
+
+def render_zonas(pares, max_n=10):
+    return render_ranking(pares, max_n=max_n, color="#7c3aed")
+
+
+def render_por_anio(anios_clase, anios_ordenados):
+    """Barras apiladas por año: proporción pequeña/mediana/grande/desconocida, ancho ~ total del año."""
+    colores = {"pequena": "#4cc9f0", "mediana": "#4ade80", "grande": "#fb923c", "desconocida": "#94a3b8"}
+    totales = {a: sum(anios_clase[a].values()) for a in anios_ordenados}
+    max_total = max(totales.values()) if totales else 1
+    filas = []
+    for a in anios_ordenados:
+        c = anios_clase[a]
+        total = totales[a] or 1
+        ancho_track = round(totales[a] / max_total * 100, 1) if max_total else 0
+        segmentos = "".join(
+            f'<div class="segmento" style="width:{c.get(clase, 0) / total * 100:.1f}%;background:{col}" '
+            f'title="{clase}: {c.get(clase, 0)}"></div>'
+            for clase, col in colores.items() if c.get(clase, 0) > 0
+        )
+        filas.append(f'''
+          <div class="anio-fila" data-anio="{escapar(a)}">
+            <div class="anio-label">{escapar(a)}</div>
+            <div class="anio-track" style="width:{ancho_track}%">{segmentos}</div>
+            <div class="anio-valor">{totales[a]}</div>
+          </div>''')
+    return "\n".join(filas)
+
+
+# Rampa secuencial (un solo tono, claro→oscuro = magnitud), tomada de la
+# misma familia de azul que ya usa el sitio (fondo "en-mapa" claro / header
+# oscuro), para que el heatmap combine con el resto de la página.
+_HEATMAP_CLARO = (224, 247, 254)   # #e0f7fe
+_HEATMAP_OSCURO = (15, 52, 96)     # #0f3460
+
+
+def color_heatmap(ratio):
+    """ratio en [0,1] -> color de fondo de la celda (interpolación lineal claro→oscuro)."""
+    r = round(_HEATMAP_CLARO[0] + (_HEATMAP_OSCURO[0] - _HEATMAP_CLARO[0]) * ratio)
+    g = round(_HEATMAP_CLARO[1] + (_HEATMAP_OSCURO[1] - _HEATMAP_CLARO[1]) * ratio)
+    b = round(_HEATMAP_CLARO[2] + (_HEATMAP_OSCURO[2] - _HEATMAP_CLARO[2]) * ratio)
+    return f"rgb({r},{g},{b})"
+
+
+def texto_heatmap(ratio):
+    """Texto blanco sobre celdas oscuras, tinta oscura sobre celdas claras (contraste)."""
+    return "#ffffff" if ratio > 0.55 else "#1a1a2e"
+
+
+def render_matriz_empresa_depto(proyectos, empresa_canonica, top_empresas):
+    """
+    Heatmap departamento × empresa (top N fijo): color = magnitud (secuencial,
+    un solo tono, claro→oscuro), número = valor exacto en cada celda. Responde
+    preguntas tipo "¿cuántas tiene SUNTACC en Cesar / Bolívar / etc.?". Filas =
+    departamentos con al menos una solicitud de alguna empresa del top,
+    ordenados por total desc.
+    """
+    conteo = defaultdict(lambda: defaultdict(int))
+    total_por_depto = Counter()
+    total_por_empresa = Counter()
+    for p in proyectos:
+        sol = p.get("solicitante")
+        nombre = empresa_canonica.get(sol) if sol else None
+        if nombre not in top_empresas:
+            continue
+        depto = p.get("departamento") or "(Sin departamento)"
+        conteo[depto][nombre] += 1
+        total_por_depto[depto] += 1
+        total_por_empresa[nombre] += 1
+
+    deptos_ordenados = [d for d, _ in total_por_depto.most_common()]
+    if not deptos_ordenados:
+        return '<div class="analisis-vacio">Sin datos</div>'
+
+    max_celda = max(
+        (conteo[d][e] for d in deptos_ordenados for e in top_empresas),
+        default=0,
+    ) or 1
+
+    encabezados = "".join(
+        f'<div class="heatmap-col-header" title="{escapar(e)}">{escapar(e)}</div>' for e in top_empresas
+    )
+
+    filas_html = []
+    for depto in deptos_ordenados:
+        filas_html.append(f'<div class="heatmap-row-header" title="{escapar(depto)}">{escapar(depto)}</div>')
+        for e in top_empresas:
+            n = conteo[depto][e]
+            ratio = n / max_celda if n else 0
+            estilo = f"background:{color_heatmap(ratio)};color:{texto_heatmap(ratio)}" if n else ""
+            clase = "heatmap-cell" + ("" if n else " heatmap-cell-vacia")
+            filas_html.append(
+                f'<div class="{clase}" style="{estilo}" '
+                f'title="{escapar(e)} · {escapar(depto)}: {n} solicitud{"es" if n != 1 else ""}">{n or "–"}</div>'
+            )
+        filas_html.append(f'<div class="heatmap-cell heatmap-total-cell">{total_por_depto[depto]}</div>')
+
+    fila_total = "".join(
+        f'<div class="heatmap-cell heatmap-total-cell">{total_por_empresa[e]}</div>' for e in top_empresas
+    )
+
+    n_cols = len(top_empresas)
+    return f'''
+    <div class="heatmap-wrapper">
+      <div class="heatmap-escala">
+        <span>Menos</span>
+        <span class="heatmap-escala-barra"></span>
+        <span>Más</span>
+      </div>
+      <div class="heatmap-grid" style="grid-template-columns: minmax(130px,auto) repeat({n_cols}, minmax(64px,1fr)) minmax(56px,auto);">
+        <div class="heatmap-corner"></div>
+        {encabezados}
+        <div class="heatmap-col-header heatmap-total-header">Total</div>
+        {"".join(filas_html)}
+        <div class="heatmap-row-header heatmap-total-header">Total</div>
+        {fila_total}
+        <div class="heatmap-cell heatmap-total-cell"></div>
+      </div>
+    </div>'''
+
+
 def main():
     if not os.path.exists(ENTRADA):
         print(f"No se encontró {ENTRADA}. Ejecuta primero: python extraer.py")
@@ -399,13 +555,97 @@ def main():
         lat_centro = round(sum(p["lat"] for p in con_mapa) / len(con_mapa), 4)
         lon_centro = round(sum(p["lon"] for p in con_mapa) / len(con_mapa), 4)
 
+    # ── Análisis: minigranjas (mediana escala, 0.9-1 MW) vs gran escala (>1 MW) ──
+    proyectos_mediana = [p for p in proyectos if capacidad_clase(p.get("capacidad_kw")) == "mediana"]
+    proyectos_grande = [p for p in proyectos if capacidad_clase(p.get("capacidad_kw")) == "grande"]
+
+    ranking_empresas_mediana = contar_por_empresa(proyectos_mediana, empresa_canonica)
+    ranking_empresas_grande = contar_por_empresa(proyectos_grande, empresa_canonica)
+
+    ranking_zonas = Counter(
+        p.get("departamento") or "(Sin departamento)" for p in proyectos
+    ).most_common(10)
+
+    anios_clase = defaultdict(Counter)
+    for p in proyectos:
+        anio = anio_resolucion(p.get("fecha_resolucion")) or "Sin fecha"
+        anios_clase[anio][capacidad_clase(p.get("capacidad_kw"))] += 1
+    anios_ordenados = sorted(anios_clase.keys(), key=lambda a: (a == "Sin fecha", a))
+
+    # ── Matriz empresa (top N, fijo por total general) × departamento ──
+    TOP_N_EMPRESAS_MATRIZ = 8
+    ranking_empresas_general = contar_por_empresa(proyectos, empresa_canonica)
+    top_empresas_matriz = [
+        nombre for nombre, _ in ranking_empresas_general
+        if nombre != "(Sin empresa)"
+    ][:TOP_N_EMPRESAS_MATRIZ]
+    matriz_empresa_depto_html = render_matriz_empresa_depto(proyectos, empresa_canonica, top_empresas_matriz)
+
+    opciones_anio = "\n".join(
+        f'<option value="{a}">{a}</option>' for a in anios
+    )
+
+    analisis_html = f"""
+<section class="analisis">
+  <div class="analisis-header">
+    <h2 class="analisis-titulo">📊 Sección de Análisis</h2>
+    <div class="analisis-filtro">
+      <label for="analisis-anio">Año de resolución:</label>
+      <select id="analisis-anio">
+        <option value="">Todos</option>
+        {opciones_anio}
+      </select>
+    </div>
+  </div>
+  <div class="analisis-grid">
+    <div class="analisis-panel">
+      <h3>Minigranjas / Mediana escala <span class="analisis-sub" id="analisis-mediana-count">(500 kW – 1 MW · {len(proyectos_mediana)} solicitudes)</span></h3>
+      <p class="analisis-desc">Nº de solicitudes por empresa</p>
+      <div id="analisis-mediana-ranking" data-color="#4ade80">
+      {render_ranking(ranking_empresas_mediana, color="#4ade80")}
+      </div>
+    </div>
+    <div class="analisis-panel">
+      <h3>Gran escala <span class="analisis-sub" id="analisis-grande-count">(&gt; 1 MW · {len(proyectos_grande)} solicitudes)</span></h3>
+      <p class="analisis-desc">Nº de solicitudes por empresa</p>
+      <div id="analisis-grande-ranking" data-color="#fb923c">
+      {render_ranking(ranking_empresas_grande, color="#fb923c")}
+      </div>
+    </div>
+    <div class="analisis-panel">
+      <h3>Zonas principales <span class="analisis-sub" id="analisis-zonas-count">(Top 10 departamentos · {len(proyectos)} solicitudes)</span></h3>
+      <p class="analisis-desc">Nº de solicitudes por departamento</p>
+      <div id="analisis-zonas-ranking" data-color="#7c3aed">
+      {render_zonas(ranking_zonas)}
+      </div>
+    </div>
+    <div class="analisis-panel analisis-panel-ancho">
+      <h3>Por año de resolución <span class="analisis-sub">(el año seleccionado arriba se resalta)</span></h3>
+      <p class="analisis-desc">
+        <span class="leyenda-item"><span class="dot pequena"></span> Pequeña</span>
+        <span class="leyenda-item"><span class="dot mediana"></span> Mediana / Minigranja</span>
+        <span class="leyenda-item"><span class="dot grande"></span> Grande</span>
+        <span class="leyenda-item"><span class="dot desconocida"></span> Desconocida</span>
+      </p>
+      <div id="analisis-por-anio">
+      {render_por_anio(anios_clase, anios_ordenados)}
+      </div>
+    </div>
+    <div class="analisis-panel analisis-panel-ancho">
+      <h3>Distribución por empresa y departamento <span class="analisis-sub" id="analisis-matriz-count">(Top {TOP_N_EMPRESAS_MATRIZ} empresas · {len(proyectos)} solicitudes)</span></h3>
+      <p class="analisis-desc">Nº de solicitudes por departamento, para cada una de las empresas con más solicitudes en total</p>
+      <div id="analisis-matriz">
+      {matriz_empresa_depto_html}
+      </div>
+    </div>
+  </div>
+</section>
+"""
+
     datos_js = json.dumps(proyectos, ensure_ascii=False)
 
     opciones_dept = "\n".join(
         f'<option value="{d}">{d}</option>' for d in departamentos
-    )
-    opciones_anio = "\n".join(
-        f'<option value="{a}">{a}</option>' for a in anios
     )
 
     html = f"""<!DOCTYPE html>
@@ -476,6 +716,25 @@ def main():
   .dot.mediana  {{ background: #4ade80; }}
   .dot.grande   {{ background: #fb923c; }}
   .dot.desconocida {{ background: #94a3b8; }}
+
+  .leyenda-item.leyenda-toggle {{
+    cursor: pointer;
+    user-select: none;
+    border: none;
+    background: none;
+    font: inherit;
+    padding: 4px 6px;
+    border-radius: 6px;
+    color: #1a1a2e;
+    transition: background 0.15s, opacity 0.15s;
+  }}
+  .leyenda-item.leyenda-toggle:hover {{ background: #f0f7ff; }}
+  .leyenda-item.leyenda-toggle.inactivo {{ opacity: 0.45; }}
+  .leyenda-item.leyenda-toggle.inactivo .dot {{
+    background: #d1d5db !important;
+    border-color: #cbd5e1 !important;
+  }}
+  .leyenda-hint {{ font-size: 0.72rem; color: #999; font-style: italic; }}
 
   .controles {{
     display: flex;
@@ -661,6 +920,140 @@ def main():
     border-bottom: 1px solid #ddd6fe;
     display: none;
   }}
+
+  .analisis {{
+    padding: 20px 24px 8px;
+    background: #fff;
+    border-bottom: 1px solid #e0e0e0;
+  }}
+  .analisis-header {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 14px;
+  }}
+  .analisis-titulo {{ font-size: 1.05rem; color: #1a1a2e; }}
+  .analisis-filtro {{ display: flex; align-items: center; gap: 8px; font-size: 0.82rem; color: #334155; }}
+  .analisis-filtro label {{ font-weight: 600; }}
+  .analisis-filtro select {{
+    padding: 6px 10px;
+    border: 1.5px solid #cbd5e1;
+    border-radius: 6px;
+    font-size: 0.82rem;
+    outline: none;
+  }}
+  .analisis-filtro select:focus {{ border-color: #0f3460; }}
+  .analisis-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 18px;
+  }}
+  .analisis-panel {{
+    background: #f8fafc;
+    border: 1px solid #e5e9f0;
+    border-radius: 10px;
+    padding: 14px 16px 16px;
+  }}
+  .analisis-panel-ancho {{ grid-column: 1 / -1; }}
+  .analisis-panel h3 {{ font-size: 0.9rem; color: #1a1a2e; margin-bottom: 2px; }}
+  .analisis-sub {{ font-weight: 400; font-size: 0.78rem; color: #64748b; }}
+  .analisis-desc {{ font-size: 0.75rem; color: #64748b; margin-bottom: 10px; display: flex; gap: 14px; flex-wrap: wrap; }}
+  .analisis-vacio {{ font-size: 0.8rem; color: #999; font-style: italic; }}
+
+  .barra-fila {{
+    display: grid;
+    grid-template-columns: minmax(90px, 1fr) 3fr auto;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+    font-size: 0.78rem;
+  }}
+  .barra-label {{ color: #334155; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .barra-track {{ background: #e5e9f0; border-radius: 4px; height: 10px; overflow: hidden; }}
+  .barra-fill {{ height: 100%; border-radius: 4px; }}
+  .barra-valor {{ font-weight: 700; color: #1a1a2e; text-align: right; min-width: 22px; }}
+
+  .anio-fila {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 6px;
+    font-size: 0.78rem;
+    border-radius: 6px;
+    transition: background 0.15s;
+  }}
+  .anio-label {{ width: 64px; flex: none; color: #334155; font-weight: 600; }}
+  .anio-track {{ display: flex; height: 14px; border-radius: 4px; overflow: hidden; background: #e5e9f0; min-width: 20px; }}
+  .anio-track .segmento {{ height: 100%; }}
+  .anio-valor {{ font-weight: 700; color: #1a1a2e; min-width: 26px; }}
+  .anio-fila-activa {{ background: #eef2ff; box-shadow: inset 0 0 0 1.5px #4338ca; }}
+  .anio-fila-activa .anio-label {{ color: #4338ca; }}
+
+  .heatmap-wrapper, #analisis-matriz {{ overflow-x: auto; }}
+  .heatmap-escala {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.72rem;
+    color: #64748b;
+    margin-bottom: 10px;
+  }}
+  .heatmap-escala-barra {{
+    width: 90px;
+    height: 10px;
+    border-radius: 5px;
+    background: linear-gradient(to right, rgb(224,247,254), rgb(15,52,96));
+  }}
+
+  .heatmap-grid {{
+    display: grid;
+    gap: 2px;
+    background: #f8fafc;
+    font-size: 0.78rem;
+    min-width: max-content;
+  }}
+  .heatmap-corner {{ background: #1a1a2e; position: sticky; left: 0; top: 0; z-index: 3; }}
+  .heatmap-col-header {{
+    background: #1a1a2e;
+    color: #fff;
+    font-weight: 600;
+    padding: 7px 8px;
+    text-align: center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }}
+  .heatmap-row-header {{
+    background: #eef1f6;
+    color: #334155;
+    font-weight: 600;
+    padding: 7px 10px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 180px;
+    position: sticky;
+    left: 0;
+  }}
+  .heatmap-cell {{
+    padding: 7px 6px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+    border-radius: 4px;
+  }}
+  .heatmap-cell-vacia {{ background: #f1f5f9; color: #cbd5e1; }}
+  .heatmap-col-header.heatmap-total-header,
+  .heatmap-row-header.heatmap-total-header {{ background: #0f3460; color: #fff; }}
+  .heatmap-cell.heatmap-total-cell {{
+    background: #eef1f6;
+    color: #1a1a2e;
+    font-weight: 700;
+  }}
 </style>
 </head>
 <body>
@@ -694,11 +1087,14 @@ def main():
 
 <div class="leyenda-wrapper">
   <span class="leyenda-titulo">Capacidad:</span>
-  <div class="leyenda-item"><span class="dot pequena"></span> &lt; 500 kW</div>
-  <div class="leyenda-item"><span class="dot mediana"></span> 500 kW – 1 MW</div>
-  <div class="leyenda-item"><span class="dot grande"></span> &gt; 1 MW</div>
-  <div class="leyenda-item"><span class="dot desconocida"></span> Desconocida</div>
+  <button type="button" class="leyenda-item leyenda-toggle" data-clase="pequena"><span class="dot pequena"></span> &lt; 500 kW</button>
+  <button type="button" class="leyenda-item leyenda-toggle" data-clase="mediana"><span class="dot mediana"></span> 500 kW – 1 MW</button>
+  <button type="button" class="leyenda-item leyenda-toggle" data-clase="grande"><span class="dot grande"></span> &gt; 1 MW</button>
+  <button type="button" class="leyenda-item leyenda-toggle" data-clase="desconocida"><span class="dot desconocida"></span> Desconocida</button>
+  <span class="leyenda-hint">clic para mostrar/ocultar</span>
 </div>
+
+{analisis_html}
 
 <div class="controles">
   <label>Buscar:</label>
@@ -756,6 +1152,7 @@ const DATOS = {datos_js};
 const SIN_EMPRESA = "__sin_empresa__";
 const EMPRESAS = {json.dumps(empresas, ensure_ascii=False)}{' .concat([SIN_EMPRESA])' if hay_sin_empresa else ''};
 const EMPRESA_CANONICA = {json.dumps(empresa_canonica, ensure_ascii=False)};
+const TOP_EMPRESAS_MATRIZ = {json.dumps(top_empresas_matriz, ensure_ascii=False)};
 let empresasSeleccionadas = new Set(EMPRESAS);
 
 const COLORES = {{
@@ -901,15 +1298,34 @@ function renderTabla(datos) {{
 }}
 
 function actualizarMarcadores(datos) {{
+  const visibles = new Set(datos);
   DATOS.forEach((p, i) => {{
-    if (!marcadores[i]) return;
-    if (datos.includes(p)) {{
-      marcadores[i].setOpacity(1);
+    const m = marcadores[i];
+    if (!m) return;
+    if (visibles.has(p)) {{
+      if (!map.hasLayer(m)) m.addTo(map);
     }} else {{
-      marcadores[i].setOpacity(0.15);
+      if (map.hasLayer(m)) map.removeLayer(m);
     }}
   }});
 }}
+
+// ── Leyenda de capacidad (clic para mostrar/ocultar) ────────────────────────
+let clasesVisibles = new Set(["pequena", "mediana", "grande", "desconocida"]);
+
+document.querySelectorAll(".leyenda-toggle").forEach(btn => {{
+  btn.addEventListener("click", () => {{
+    const clase = btn.dataset.clase;
+    if (clasesVisibles.has(clase)) {{
+      clasesVisibles.delete(clase);
+      btn.classList.add("inactivo");
+    }} else {{
+      clasesVisibles.add(clase);
+      btn.classList.remove("inactivo");
+    }}
+    aplicarFiltros();
+  }});
+}});
 
 // ── Filtros ────────────────────────────────────────────────────────────────
 function aplicarFiltros() {{
@@ -924,7 +1340,8 @@ function aplicarFiltros() {{
     const okD = !dept || p.departamento === dept;
     const okA = !anio || anioResolucion(p.fecha_resolucion) === anio;
     const okE = empresasSeleccionadas.has(EMPRESA_CANONICA[p.solicitante] || SIN_EMPRESA);
-    return okQ && okD && okA && okE;
+    const okC = clasesVisibles.has(capClase(p.capacidad_kw));
+    return okQ && okD && okA && okE && okC;
   }});
 
   if (colOrden) {{
@@ -1035,6 +1452,8 @@ document.getElementById("btn-reset").addEventListener("click", () => {{
   empresasSeleccionadas = new Set(EMPRESAS);
   renderListaEmpresas();
   actualizarBotonEmp();
+  clasesVisibles = new Set(["pequena", "mediana", "grande", "desconocida"]);
+  document.querySelectorAll(".leyenda-toggle").forEach(btn => btn.classList.remove("inactivo"));
   colOrden = null; dirOrden = 1;
   document.querySelectorAll("thead th").forEach(th => th.classList.remove("asc","desc"));
   aplicarFiltros();
@@ -1065,6 +1484,149 @@ if (sinCoords.length > 0) {{
   div.style.display = "block";
   div.textContent = `⚠️ ${{sinCoords.length}} proyecto(s) no tienen coordenadas y no aparecen en el mapa (sí aparecen en la tabla).`;
 }}
+
+// ── Sección de Análisis: filtro por año ─────────────────────────────────────
+function contarPorEmpresaJS(lista) {{
+  const c = new Map();
+  lista.forEach(p => {{
+    const nombre = p.solicitante ? (EMPRESA_CANONICA[p.solicitante] || p.solicitante) : null;
+    const clave = nombre || "(Sin empresa)";
+    c.set(clave, (c.get(clave) || 0) + 1);
+  }});
+  return Array.from(c.entries()).sort((a, b) => b[1] - a[1]);
+}}
+
+function renderRankingJS(pares, contenedorId, maxN) {{
+  const cont = document.getElementById(contenedorId);
+  const color = cont.dataset.color || "#0f3460";
+  const top = pares.slice(0, maxN || 15);
+  if (!top.length) {{
+    cont.innerHTML = '<div class="analisis-vacio">Sin datos</div>';
+    return;
+  }}
+  const maximo = Math.max(...top.map(([, c]) => c));
+  cont.innerHTML = top.map(([nombre, cnt]) => {{
+    const pct = maximo ? (cnt / maximo * 100).toFixed(1) : 0;
+    return `<div class="barra-fila">
+      <div class="barra-label" title="${{nombre}}">${{nombre}}</div>
+      <div class="barra-track"><div class="barra-fill" style="width:${{pct}}%;background:${{color}}"></div></div>
+      <div class="barra-valor">${{cnt}}</div>
+    </div>`;
+  }}).join("");
+}}
+
+function actualizarAnalisis() {{
+  const anio = document.getElementById("analisis-anio").value;
+  const base = anio ? DATOS.filter(p => anioResolucion(p.fecha_resolucion) === anio) : DATOS;
+
+  const mediana = base.filter(p => capClase(p.capacidad_kw) === "mediana");
+  const grande = base.filter(p => capClase(p.capacidad_kw) === "grande");
+
+  renderRankingJS(contarPorEmpresaJS(mediana), "analisis-mediana-ranking", 15);
+  renderRankingJS(contarPorEmpresaJS(grande), "analisis-grande-ranking", 15);
+
+  const zonasMap = new Map();
+  base.forEach(p => {{
+    const z = p.departamento || "(Sin departamento)";
+    zonasMap.set(z, (zonasMap.get(z) || 0) + 1);
+  }});
+  const zonas = Array.from(zonasMap.entries()).sort((a, b) => b[1] - a[1]);
+  renderRankingJS(zonas, "analisis-zonas-ranking", 10);
+
+  document.getElementById("analisis-mediana-count").textContent = `(500 kW – 1 MW · ${{mediana.length}} solicitudes)`;
+  document.getElementById("analisis-grande-count").textContent = `(> 1 MW · ${{grande.length}} solicitudes)`;
+  document.getElementById("analisis-zonas-count").textContent = `(Top 10 departamentos · ${{base.length}} solicitudes)`;
+
+  document.querySelectorAll(".anio-fila").forEach(el => {{
+    el.classList.toggle("anio-fila-activa", anio !== "" && el.dataset.anio === anio);
+  }});
+
+  renderMatrizEmpresaDepto(base);
+  document.getElementById("analisis-matriz-count").textContent =
+    `(Top ${{TOP_EMPRESAS_MATRIZ.length}} empresas · ${{base.length}} solicitudes)`;
+}}
+
+function renderMatrizEmpresaDepto(base) {{
+  const cont = document.getElementById("analisis-matriz");
+  const conteo = new Map();     // depto -> Map(empresa -> n)
+  const totalPorDepto = new Map();
+  const totalPorEmpresa = new Map(TOP_EMPRESAS_MATRIZ.map(e => [e, 0]));
+
+  base.forEach(p => {{
+    const nombre = p.solicitante ? (EMPRESA_CANONICA[p.solicitante] || p.solicitante) : null;
+    if (!TOP_EMPRESAS_MATRIZ.includes(nombre)) return;
+    const depto = p.departamento || "(Sin departamento)";
+    if (!conteo.has(depto)) conteo.set(depto, new Map());
+    const fila = conteo.get(depto);
+    fila.set(nombre, (fila.get(nombre) || 0) + 1);
+    totalPorDepto.set(depto, (totalPorDepto.get(depto) || 0) + 1);
+    totalPorEmpresa.set(nombre, (totalPorEmpresa.get(nombre) || 0) + 1);
+  }});
+
+  const deptosOrdenados = Array.from(totalPorDepto.entries()).sort((a, b) => b[1] - a[1]);
+
+  if (!deptosOrdenados.length) {{
+    cont.innerHTML = '<div class="analisis-vacio">Sin datos</div>';
+    return;
+  }}
+
+  let maxCelda = 0;
+  deptosOrdenados.forEach(([depto]) => {{
+    const fila = conteo.get(depto) || new Map();
+    TOP_EMPRESAS_MATRIZ.forEach(e => {{ maxCelda = Math.max(maxCelda, fila.get(e) || 0); }});
+  }});
+  maxCelda = maxCelda || 1;
+
+  const encabezados = TOP_EMPRESAS_MATRIZ.map(e =>
+    `<div class="heatmap-col-header" title="${{e}}">${{e}}</div>`).join("");
+
+  const filasHtml = deptosOrdenados.map(([depto, total]) => {{
+    const fila = conteo.get(depto) || new Map();
+    const celdas = TOP_EMPRESAS_MATRIZ.map(e => {{
+      const n = fila.get(e) || 0;
+      const ratio = n ? n / maxCelda : 0;
+      const estilo = n ? `background:${{colorHeatmap(ratio)}};color:${{textoHeatmap(ratio)}}` : "";
+      const clase = "heatmap-cell" + (n ? "" : " heatmap-cell-vacia");
+      const tip = `${{e}} · ${{depto}}: ${{n}} solicitud${{n !== 1 ? "es" : ""}}`;
+      return `<div class="${{clase}}" style="${{estilo}}" title="${{tip}}">${{n || "–"}}</div>`;
+    }}).join("");
+    return `<div class="heatmap-row-header" title="${{depto}}">${{depto}}</div>${{celdas}}`
+      + `<div class="heatmap-cell heatmap-total-cell">${{total}}</div>`;
+  }}).join("");
+
+  const filaTotal = TOP_EMPRESAS_MATRIZ.map(e =>
+    `<div class="heatmap-cell heatmap-total-cell">${{totalPorEmpresa.get(e) || 0}}</div>`).join("");
+
+  const nCols = TOP_EMPRESAS_MATRIZ.length;
+  cont.innerHTML = `
+    <div class="heatmap-escala">
+      <span>Menos</span>
+      <span class="heatmap-escala-barra"></span>
+      <span>Más</span>
+    </div>
+    <div class="heatmap-grid" style="grid-template-columns: minmax(130px,auto) repeat(${{nCols}}, minmax(64px,1fr)) minmax(56px,auto);">
+      <div class="heatmap-corner"></div>
+      ${{encabezados}}
+      <div class="heatmap-col-header heatmap-total-header">Total</div>
+      ${{filasHtml}}
+      <div class="heatmap-row-header heatmap-total-header">Total</div>
+      ${{filaTotal}}
+      <div class="heatmap-cell heatmap-total-cell"></div>
+    </div>`;
+}}
+
+function colorHeatmap(ratio) {{
+  const claro = [224, 247, 254], oscuro = [15, 52, 96];
+  const c = claro.map((v, i) => Math.round(v + (oscuro[i] - v) * ratio));
+  return `rgb(${{c[0]}},${{c[1]}},${{c[2]}})`;
+}}
+
+function textoHeatmap(ratio) {{
+  return ratio > 0.55 ? "#ffffff" : "#1a1a2e";
+}}
+
+document.getElementById("analisis-anio").addEventListener("change", actualizarAnalisis);
+actualizarAnalisis();
 
 // Render inicial
 aplicarFiltros();
